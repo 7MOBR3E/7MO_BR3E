@@ -1,0 +1,413 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - name: Create project files
+        run: |
+          cat > settings.gradle.kts <<'END_0'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "DeepUninstaller"
+          include(":app")
+          END_0
+          cat > build.gradle.kts <<'END_1'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          END_1
+          cat > gradle.properties <<'END_2'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          END_2
+          mkdir -p app
+          cat > app/build.gradle.kts <<'END_3'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.deepuninstaller"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.deepuninstaller"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies {
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.material3:material3")
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.activity:activity-compose:1.9.0")
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("dev.rikka.shizuku:api:13.1.5")
+              implementation("dev.rikka.shizuku:provider:13.1.5")
+          }
+          END_3
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'END_4'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+              <application
+                  android:label="الحذف الشامل"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <provider
+                      android:name="rikka.shizuku.ShizukuProvider"
+                      android:authorities="${applicationId}.shizuku"
+                      android:enabled="true"
+                      android:exported="true"
+                      android:multiprocess="false"
+                      android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+              </application>
+          </manifest>
+          END_4
+          mkdir -p app/src/main/java/com/example/deepuninstaller
+          cat > app/src/main/java/com/example/deepuninstaller/Core.kt <<'END_5'
+          package com.example.deepuninstaller
+
+          import android.content.Context
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import rikka.shizuku.Shizuku
+
+          data class AppItem(val label: String, val pkg: String, val system: Boolean, val installed: Boolean)
+          data class Entry(val label: String, val pkg: String, val time: Long, val ok: Boolean, val msg: String)
+
+          object Sh {
+              fun ready() = try {
+                  Shizuku.pingBinder() && Shizuku.checkSelfPermission() == android.content.pm.PackageManager.PERMISSION_GRANTED
+              } catch (e: Throwable) { false }
+
+              fun run(cmd: String): Pair<Int, String> = try {
+                  val m = Shizuku::class.java.getDeclaredMethod(
+                      "newProcess", Array<String>::class.java, Array<String>::class.java, String::class.java
+                  )
+                  m.isAccessible = true
+                  val p = m.invoke(null, arrayOf("sh", "-c", cmd), null, null) as Process
+                  val out = p.inputStream.bufferedReader().readText()
+                  val err = p.errorStream.bufferedReader().readText()
+                  val code = p.waitFor()
+                  code to (out + err).trim()
+              } catch (e: Throwable) { -1 to (e.message ?: "error") }
+
+              fun dataDirs(): List<String> =
+                  run("ls /sdcard/Android/data").second.lines().map { it.trim() }.filter { it.contains('.') }
+
+              private val protectedExact = setOf(
+                  "android", "com.android.systemui", "com.android.settings", "com.android.phone",
+                  "com.android.shell", "com.android.packageinstaller", "com.google.android.packageinstaller",
+                  "moe.shizuku.privileged.api", "moe.shizuku.manager", "com.example.deepuninstaller"
+              )
+
+              fun isProtected(ctx: Context, pkg: String): Boolean {
+                  if (pkg in protectedExact || pkg.startsWith("com.android.providers")) return true
+                  val home = ctx.packageManager.resolveActivity(
+                      android.content.Intent(android.content.Intent.ACTION_MAIN).addCategory(android.content.Intent.CATEGORY_HOME), 0
+                  )?.activityInfo?.packageName
+                  return pkg == home
+              }
+
+              fun delete(item: AppItem, backup: Boolean): Pair<Boolean, String> {
+                  val pkg = item.pkg
+                  if (!Regex("^[A-Za-z0-9_.]+$").matches(pkg)) return false to "اسم حزمة غير صالح"
+                  val log = StringBuilder()
+                  if (item.installed) {
+                      if (backup) {
+                          val apk = run("pm path $pkg").second.lines().firstOrNull()?.removePrefix("package:")?.trim()
+                          if (!apk.isNullOrEmpty()) {
+                              run("mkdir -p /sdcard/Download/AppBackup && cp '$apk' /sdcard/Download/AppBackup/$pkg.apk")
+                              log.append("نسخة احتياطية: Download/AppBackup\n")
+                          }
+                      }
+                      run("pm clear $pkg")
+                      val r = if (item.system) run("pm uninstall --user 0 $pkg") else run("pm uninstall $pkg")
+                      if (!r.second.contains("Success")) return false to "فشل الحذف: ${r.second}"
+                      log.append("تم حذف التطبيق\n")
+                  }
+                  run("rm -rf /sdcard/Android/data/$pkg /sdcard/Android/obb/$pkg /sdcard/Android/media/$pkg")
+                  log.append("تم مسح بقايا data / obb / media")
+                  return true to log.toString()
+              }
+          }
+
+          object Store {
+              private fun sp(c: Context) = c.getSharedPreferences("history", Context.MODE_PRIVATE)
+              fun load(c: Context): List<Entry> {
+                  val a = JSONArray(sp(c).getString("h", "[]"))
+                  return (0 until a.length()).map {
+                      val o = a.getJSONObject(it)
+                      Entry(o.getString("l"), o.getString("p"), o.getLong("t"), o.getBoolean("ok"), o.getString("m"))
+                  }
+              }
+              fun add(c: Context, e: Entry) {
+                  val a = JSONArray()
+                  (listOf(e) + load(c)).take(200).forEach {
+                      a.put(JSONObject().put("l", it.label).put("p", it.pkg).put("t", it.time).put("ok", it.ok).put("m", it.msg))
+                  }
+                  sp(c).edit().putString("h", a.toString()).apply()
+              }
+              fun clear(c: Context) = sp(c).edit().remove("h").apply()
+          }
+          END_5
+          mkdir -p app/src/main/java/com/example/deepuninstaller
+          cat > app/src/main/java/com/example/deepuninstaller/MainActivity.kt <<'END_6'
+          package com.example.deepuninstaller
+
+          import android.content.Context
+          import android.content.pm.ApplicationInfo
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.Image
+          import androidx.compose.foundation.clickable
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.graphics.asImageBitmap
+          import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.unit.dp
+          import androidx.core.graphics.drawable.toBitmap
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import rikka.shizuku.Shizuku
+          import java.text.SimpleDateFormat
+          import java.util.*
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent { MaterialTheme(colorScheme = darkColorScheme()) { App() } }
+              }
+          }
+
+          fun loadApps(ctx: Context): List<AppItem> {
+              val pm = ctx.packageManager
+              return pm.getInstalledApplications(0).map {
+                  AppItem(
+                      it.loadLabel(pm).toString(), it.packageName,
+                      (it.flags and ApplicationInfo.FLAG_SYSTEM) != 0, true
+                  )
+              }.sortedBy { it.label.lowercase() }
+          }
+
+          @Composable
+          fun AppIcon(item: AppItem) {
+              val ctx = LocalContext.current
+              val bmp = remember(item.pkg) {
+                  try { ctx.packageManager.getApplicationIcon(item.pkg).toBitmap(120, 120).asImageBitmap() } catch (e: Throwable) { null }
+              }
+              if (bmp != null) Image(bmp, null, Modifier.size(44.dp)) else Text("📁", Modifier.size(44.dp))
+          }
+
+          @Composable
+          fun AppRow(item: AppItem, onClick: () -> Unit) {
+              Row(
+                  Modifier.fillMaxWidth().clickable { onClick() }.padding(horizontal = 16.dp, vertical = 8.dp),
+                  verticalAlignment = Alignment.CenterVertically
+              ) {
+                  AppIcon(item)
+                  Spacer(Modifier.width(12.dp))
+                  Column(Modifier.weight(1f)) {
+                      Text(item.label, style = MaterialTheme.typography.bodyLarge)
+                      Text(item.pkg, style = MaterialTheme.typography.bodySmall)
+                  }
+                  if (item.system) Text("نظام", color = MaterialTheme.colorScheme.error)
+                  else if (!item.installed) Text("بقايا", color = MaterialTheme.colorScheme.tertiary)
+              }
+          }
+
+          @OptIn(ExperimentalMaterial3Api::class)
+          @Composable
+          fun App() {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              val snack = remember { SnackbarHostState() }
+              var ready by remember { mutableStateOf(Sh.ready()) }
+              var tab by remember { mutableIntStateOf(0) }
+              var apps by remember { mutableStateOf(listOf<AppItem>()) }
+              var dirs by remember { mutableStateOf(listOf<String>()) }
+              var history by remember { mutableStateOf(Store.load(ctx)) }
+              var pending by remember { mutableStateOf<AppItem?>(null) }
+              var busy by remember { mutableStateOf(false) }
+
+              fun refresh() {
+                  scope.launch {
+                      val a = withContext(Dispatchers.IO) { loadApps(ctx) }
+                      val d = withContext(Dispatchers.IO) { if (Sh.ready()) Sh.dataDirs() else emptyList() }
+                      apps = a; dirs = d
+                  }
+              }
+
+              DisposableEffect(Unit) {
+                  val l1 = Shizuku.OnRequestPermissionResultListener { _, _ -> ready = Sh.ready(); refresh() }
+                  val l2 = Shizuku.OnBinderReceivedListener { ready = Sh.ready(); refresh() }
+                  Shizuku.addRequestPermissionResultListener(l1)
+                  Shizuku.addBinderReceivedListener(l2)
+                  onDispose {
+                      Shizuku.removeRequestPermissionResultListener(l1)
+                      Shizuku.removeBinderReceivedListener(l2)
+                  }
+              }
+              LaunchedEffect(ready) { refresh() }
+
+              val installedPkgs = apps.map { it.pkg }.toSet()
+              val leftovers = dirs.filter { it !in installedPkgs }.map { AppItem(it, it, false, false) }
+
+              Scaffold(
+                  snackbarHost = { SnackbarHost(snack) },
+                  bottomBar = {
+                      NavigationBar {
+                          listOf("🔍 بحث", "📱 التطبيقات", "🧹 بقايا", "🕘 السجل").forEachIndexed { i, t ->
+                              NavigationBarItem(selected = tab == i, onClick = { tab = i }, icon = { Text(t.take(2)) }, label = { Text(t.drop(3)) })
+                          }
+                      }
+                  }
+              ) { pad ->
+                  Column(Modifier.padding(pad).fillMaxSize()) {
+                      if (!ready) {
+                          Card(Modifier.fillMaxWidth().padding(12.dp)) {
+                              Column(Modifier.padding(12.dp)) {
+                                  Text("Shizuku غير مفعّل أو لم تُمنح الصلاحية.")
+                                  Spacer(Modifier.height(8.dp))
+                                  Button(onClick = {
+                                      try {
+                                          if (Shizuku.pingBinder()) Shizuku.requestPermission(1)
+                                          else scope.launch { snack.showSnackbar("شغّل Shizuku أولاً") }
+                                      } catch (e: Throwable) { scope.launch { snack.showSnackbar("شغّل Shizuku أولاً") } }
+                                  }) { Text("منح الصلاحية") }
+                              }
+                          }
+                      }
+                      when (tab) {
+                          0 -> {
+                              var q by remember { mutableStateOf("") }
+                              OutlinedTextField(
+                                  q, { q = it }, Modifier.fillMaxWidth().padding(12.dp),
+                                  label = { Text("اكتب اسم التطبيق أو الحزمة") }, singleLine = true
+                              )
+                              val byPkg = (apps + leftovers).associateBy { it.pkg }
+                              val results = if (q.length < 2) emptyList() else dirs.mapNotNull { byPkg[it] }.filter {
+                                  it.label.contains(q, true) || it.pkg.contains(q, true)
+                              }
+                              if (q.length >= 2 && results.isEmpty()) Text("لا نتائج في Android/data", Modifier.padding(16.dp))
+                              LazyColumn { items(results, key = { it.pkg }) { AppRow(it) { pending = it } } }
+                          }
+                          1 -> {
+                              var q by remember { mutableStateOf("") }
+                              var showSys by remember { mutableStateOf(false) }
+                              OutlinedTextField(q, { q = it }, Modifier.fillMaxWidth().padding(12.dp), label = { Text("فلترة") }, singleLine = true)
+                              Row(Modifier.padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                                  Switch(showSys, { showSys = it }); Spacer(Modifier.width(8.dp)); Text("إظهار تطبيقات النظام")
+                              }
+                              val list = apps.filter { (showSys || !it.system) && (it.label.contains(q, true) || it.pkg.contains(q, true)) }
+                              LazyColumn { items(list, key = { it.pkg }) { AppRow(it) { pending = it } } }
+                          }
+                          2 -> {
+                              Text("مجلدات في Android/data لتطبيقات غير مثبتة:", Modifier.padding(16.dp))
+                              if (leftovers.isEmpty()) Text("لا توجد بقايا 👌", Modifier.padding(16.dp))
+                              LazyColumn { items(leftovers, key = { it.pkg }) { AppRow(it) { pending = it } } }
+                          }
+                          else -> {
+                              TextButton(onClick = { Store.clear(ctx); history = emptyList() }, Modifier.padding(8.dp)) { Text("مسح السجل") }
+                              if (history.isEmpty()) Text("السجل فارغ", Modifier.padding(16.dp))
+                              val fmt = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefault())
+                              LazyColumn {
+                                  items(history) { e ->
+                                      Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+                                          Text((if (e.ok) "✅ " else "❌ ") + e.label)
+                                          Text(e.pkg, style = MaterialTheme.typography.bodySmall)
+                                          Text(fmt.format(Date(e.time)), style = MaterialTheme.typography.bodySmall)
+                                          Text(e.msg, style = MaterialTheme.typography.bodySmall)
+                                          HorizontalDivider(Modifier.padding(top = 8.dp))
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+
+              pending?.let { item ->
+                  var backup by remember(item.pkg) { mutableStateOf(true) }
+                  var understand by remember(item.pkg) { mutableStateOf(!item.system) }
+                  val blocked = Sh.isProtected(ctx, item.pkg)
+                  AlertDialog(
+                      onDismissRequest = { if (!busy) pending = null },
+                      icon = { AppIcon(item) },
+                      title = { Text("هل أنت متأكد؟") },
+                      text = {
+                          Column {
+                              Text(item.label, style = MaterialTheme.typography.titleMedium)
+                              Text(item.pkg, style = MaterialTheme.typography.bodySmall)
+                              Spacer(Modifier.height(8.dp))
+                              if (blocked) {
+                                  Text("⛔ هذا التطبيق محمي (نظام أساسي أو هذا التطبيق أو Shizuku) ولن يُحذف.", color = MaterialTheme.colorScheme.error)
+                              } else {
+                                  Text("⚠️ سيتم مسح بيانات التطبيق وحذفه وحذف مجلداته من Android/data و obb و media. لا يمكن التراجع.")
+                                  if (item.system) Text("🚨 هذا تطبيق نظام. حذفه قد يسبب مشاكل أو حلقة إقلاع.", color = MaterialTheme.colorScheme.error)
+                                  if (item.installed) Row(verticalAlignment = Alignment.CenterVertically) {
+                                      Checkbox(backup, { backup = it }); Text("نسخ APK احتياطياً في Download/AppBackup")
+                                  }
+                                  if (item.system) Row(verticalAlignment = Alignment.CenterVertically) {
+                                      Checkbox(understand, { understand = it }); Text("أفهم المخاطر")
+                                  }
+                              }
+                          }
+                      },
+                      confirmButton = {
+                          TextButton(enabled = !blocked && understand && !busy && ready, onClick = {
+                              busy = true
+                              scope.launch {
+                                  val r = withContext(Dispatchers.IO) { Sh.delete(item, backup && item.installed) }
+                                  Store.add(ctx, Entry(item.label, item.pkg, System.currentTimeMillis(), r.first, r.second))
+                                  history = Store.load(ctx)
+                                  busy = false; pending = null
+                                  snack.showSnackbar(if (r.first) "تم الحذف بنجاح" else r.second)
+                                  refresh()
+                              }
+                          }) { Text(if (busy) "جارٍ الحذف..." else "حذف نهائياً") }
+                      },
+                      dismissButton = { TextButton(enabled = !busy, onClick = { pending = null }) { Text("إلغاء") } }
+                  )
+              }
+          }
+          END_6
+      - name: Build
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DeepUninstaller-APK
+          path: app/build/outputs/apk/debug/*.apk
