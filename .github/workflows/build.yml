@@ -6,6 +6,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
@@ -44,7 +45,7 @@ jobs:
                   applicationId = "com.example.deepuninstaller"
                   minSdk = 26
                   targetSdk = 34
-                  versionCode = 1
+                  versionCode = (System.getenv("RUN_NUM") ?: "1").toInt()
                   versionName = "1.0"
               }
               buildFeatures { compose = true }
@@ -71,6 +72,7 @@ jobs:
               <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
               <application
                   android:label="الحذف الشامل"
+                  android:icon="@drawable/icon"
                   android:supportsRtl="true"
                   android:theme="@android:style/Theme.Material.NoActionBar">
                   <activity android:name=".MainActivity" android:exported="true">
@@ -94,29 +96,52 @@ jobs:
           package com.example.deepuninstaller
 
           import android.content.Context
+          import android.graphics.Bitmap
+          import android.graphics.BitmapFactory
+          import android.net.Uri
+          import android.provider.OpenableColumns
           import org.json.JSONArray
           import org.json.JSONObject
           import rikka.shizuku.Shizuku
+          import java.io.File
+          import java.security.MessageDigest
+          import java.util.UUID
 
           data class AppItem(val label: String, val pkg: String, val system: Boolean, val installed: Boolean)
           data class Entry(val label: String, val pkg: String, val time: Long, val ok: Boolean, val msg: String)
 
           object Sh {
+              const val BACKUP = "/sdcard/Download/AppBackup"
+              private val okName = Regex("^[A-Za-z0-9_.\\-]+$")
+              fun ok(s: String) = okName.matches(s)
+
               fun ready() = try {
                   Shizuku.pingBinder() && Shizuku.checkSelfPermission() == android.content.pm.PackageManager.PERMISSION_GRANTED
               } catch (e: Throwable) { false }
 
-              fun run(cmd: String): Pair<Int, String> = try {
+              private fun proc(cmd: String): Process {
                   val m = Shizuku::class.java.getDeclaredMethod(
                       "newProcess", Array<String>::class.java, Array<String>::class.java, String::class.java
                   )
                   m.isAccessible = true
-                  val p = m.invoke(null, arrayOf("sh", "-c", cmd), null, null) as Process
+                  return m.invoke(null, arrayOf("sh", "-c", cmd), null, null) as Process
+              }
+
+              fun run(cmd: String): Pair<Int, String> = try {
+                  val p = proc(cmd)
                   val out = p.inputStream.bufferedReader().readText()
                   val err = p.errorStream.bufferedReader().readText()
                   val code = p.waitFor()
                   code to (out + err).trim()
               } catch (e: Throwable) { -1 to (e.message ?: "error") }
+
+              fun installFile(f: File): Pair<Boolean, String> = try {
+                  val p = proc("pm install -r -S ${f.length()}")
+                  p.outputStream.use { o -> f.inputStream().use { it.copyTo(o) } }
+                  val out = p.inputStream.bufferedReader().readText() + p.errorStream.bufferedReader().readText()
+                  p.waitFor()
+                  out.contains("Success") to out.trim()
+              } catch (e: Throwable) { false to (e.message ?: "error") }
 
               fun dataDirs(): List<String> =
                   run("ls /sdcard/Android/data").second.lines().map { it.trim() }.filter { it.contains('.') }
@@ -135,17 +160,94 @@ jobs:
                   return pkg == home
               }
 
-              fun delete(item: AppItem, backup: Boolean): Pair<Boolean, String> {
+              // ---------- backups ----------
+              fun makeBackup(pkg: String, withData: Boolean): Pair<Boolean, String> {
+                  if (!ok(pkg)) return false to "اسم حزمة غير صالح"
+                  val paths = run("pm path $pkg").second.lines()
+                      .map { it.removePrefix("package:").trim() }.filter { it.endsWith(".apk") }
+                  if (paths.isEmpty()) return false to "لم أجد ملفات التطبيق"
+                  val dir = "$BACKUP/$pkg"
+                  run("rm -rf '$dir'; mkdir -p '$dir'")
+                  for (p in paths) run("cp '$p' '$dir/'")
+                  val copied = run("ls '$dir'").second.lines().count { it.endsWith(".apk") }
+                  if (copied != paths.size) return false to "نُسخ $copied من ${paths.size} ملف فقط"
+                  var extra = ""
+                  if (withData) {
+                      run("[ -d /sdcard/Android/data/$pkg ] && cp -r /sdcard/Android/data/$pkg '$dir/data'")
+                      run("[ -d /sdcard/Android/obb/$pkg ] && cp -r /sdcard/Android/obb/$pkg '$dir/obb'")
+                      extra = " + data/obb"
+                  }
+                  return true to "نسخة احتياطية: $copied ملف APK$extra في Download/AppBackup/$pkg"
+              }
+
+              fun listBackups(): List<String> =
+                  run("ls '$BACKUP'").second.lines().map { it.trim() }.filter { it.isNotEmpty() && ok(it) }
+
+              fun restore(name: String): Pair<Boolean, String> {
+                  if (!ok(name)) return false to "اسم غير صالح"
+                  if (name.endsWith(".apk")) {
+                      val r = run("pm install -r '$BACKUP/$name'")
+                      return r.second.contains("Success") to (if (r.second.contains("Success")) "تمت الاستعادة" else "فشل: ${r.second}")
+                  }
+                  val dir = "$BACKUP/$name"
+                  val apks = run("ls '$dir'/*.apk").second.lines().map { it.trim() }.filter { it.endsWith(".apk") }
+                  if (apks.isEmpty()) return false to "لا توجد ملفات APK في النسخة"
+                  val list = apks.joinToString(" ") { "'$it'" }
+                  val r = if (apks.size == 1) run("pm install -r $list") else run("pm install-multiple -r $list")
+                  if (!r.second.contains("Success")) return false to "فشل التثبيت: ${r.second}"
+                  run("[ -d '$dir/data' ] && mkdir -p /sdcard/Android/data/$name && cp -r '$dir/data/.' /sdcard/Android/data/$name/")
+                  run("[ -d '$dir/obb' ] && mkdir -p /sdcard/Android/obb/$name && cp -r '$dir/obb/.' /sdcard/Android/obb/$name/")
+                  return true to "تمت الاستعادة (${apks.size} ملف APK)"
+              }
+
+              fun deleteBackup(name: String): Boolean {
+                  if (!ok(name)) return false
+                  run("rm -rf '$BACKUP/$name'")
+                  return true
+              }
+
+              // ---------- app control ----------
+              fun forceStop(pkg: String): Pair<Boolean, String> =
+                  if (!ok(pkg)) false to "اسم غير صالح" else { run("am force-stop $pkg"); true to "تم الإيقاف الإجباري" }
+
+              fun setFrozen(pkg: String, frozen: Boolean): Pair<Boolean, String> {
+                  if (!ok(pkg)) return false to "اسم غير صالح"
+                  val r = if (frozen) run("pm disable-user --user 0 $pkg") else run("pm enable $pkg")
+                  return (r.first == 0) to (if (r.first == 0) (if (frozen) "تم التجميد" else "تم إلغاء التجميد") else r.second)
+              }
+
+              // ---------- root scan ----------
+              private val keepNames = setOf(
+                  "android", "download", "dcim", "pictures", "movies", "music", "documents", "alarms",
+                  "notifications", "ringtones", "podcasts", "audiobooks", "recordings", "screenshots", "appbackup"
+              )
+
+              fun scanRoots(item: AppItem): List<String> {
                   val pkg = item.pkg
-                  if (!Regex("^[A-Za-z0-9_.]+$").matches(pkg)) return false to "اسم حزمة غير صالح"
+                  if (!ok(pkg)) return emptyList()
+                  val found = linkedSetOf<String>()
+                  run("find /sdcard -maxdepth 4 -iname '*$pkg*' 2>/dev/null").second.lines().forEach { found.add(it.trim()) }
+                  val lab = item.label.trim()
+                  if (lab.length >= 3 && Regex("^[A-Za-z0-9 ._-]+$").matches(lab) && lab.lowercase() !in keepNames) {
+                      run("find /sdcard -maxdepth 1 -iname '$lab' 2>/dev/null").second.lines().forEach { found.add(it.trim()) }
+                  }
+                  val clean = found.filter {
+                      it.startsWith("/sdcard/") && !it.contains("..") && !it.contains("'") &&
+                          !it.startsWith(BACKUP) && it.length > 9
+                  }.sorted()
+                  return clean.filter { p -> clean.none { q -> q != p && p.startsWith("$q/") } }
+              }
+
+              // ---------- delete ----------
+              fun delete(item: AppItem, doBackup: Boolean, withData: Boolean, extra: List<String>): Pair<Boolean, String> {
+                  val pkg = item.pkg
+                  if (!ok(pkg)) return false to "اسم حزمة غير صالح"
                   val log = StringBuilder()
                   if (item.installed) {
-                      if (backup) {
-                          val apk = run("pm path $pkg").second.lines().firstOrNull()?.removePrefix("package:")?.trim()
-                          if (!apk.isNullOrEmpty()) {
-                              run("mkdir -p /sdcard/Download/AppBackup && cp '$apk' /sdcard/Download/AppBackup/$pkg.apk")
-                              log.append("نسخة احتياطية: Download/AppBackup\n")
-                          }
+                      if (doBackup) {
+                          val b = makeBackup(pkg, withData)
+                          if (!b.first) return false to ("فشل النسخ الاحتياطي ولم يُحذف شيء: " + b.second)
+                          log.append(b.second).append("\n")
                       }
                       run("pm clear $pkg")
                       val r = if (item.system) run("pm uninstall --user 0 $pkg") else run("pm uninstall $pkg")
@@ -153,7 +255,12 @@ jobs:
                       log.append("تم حذف التطبيق\n")
                   }
                   run("rm -rf /sdcard/Android/data/$pkg /sdcard/Android/obb/$pkg /sdcard/Android/media/$pkg")
+                  var n = 0
+                  for (p in extra) {
+                      if (p.startsWith("/sdcard/") && !p.contains("..") && !p.contains("'")) { run("rm -rf '$p'"); n++ }
+                  }
                   log.append("تم مسح بقايا data / obb / media")
+                  if (n > 0) log.append(" و$n مسار من الجذور")
                   return true to log.toString()
               }
           }
@@ -176,50 +283,203 @@ jobs:
               }
               fun clear(c: Context) = sp(c).edit().remove("h").apply()
           }
+
+          object Lock {
+              private fun sp(c: Context) = c.getSharedPreferences("lock", Context.MODE_PRIVATE)
+              private fun h(salt: String, pin: String): String =
+                  MessageDigest.getInstance("SHA-256").digest((salt + pin).toByteArray()).joinToString("") { "%02x".format(it) }
+              fun enabled(c: Context) = sp(c).getBoolean("on", false)
+              fun count(c: Context) = sp(c).getInt("n", 1)
+              fun set(c: Context, pins: List<String>) {
+                  sp(c).edit().clear().apply()
+                  val salt = UUID.randomUUID().toString()
+                  val e = sp(c).edit().putBoolean("on", true).putInt("n", pins.size).putString("salt", salt)
+                  pins.forEachIndexed { i, p -> e.putString("h$i", h(salt, p)) }
+                  e.apply()
+              }
+              fun check(c: Context, i: Int, pin: String): Boolean {
+                  val s = sp(c)
+                  val salt = s.getString("salt", "") ?: ""
+                  return s.getString("h$i", null) == h(salt, pin)
+              }
+              fun disable(c: Context) = sp(c).edit().clear().apply()
+          }
+
+          object Img {
+              fun load(c: Context, name: String): Bitmap? {
+                  val f = File(c.filesDir, name)
+                  return if (f.exists()) BitmapFactory.decodeFile(f.path) else null
+              }
+              fun remove(c: Context, name: String) { File(c.filesDir, name).delete() }
+              fun save(c: Context, uri: Uri, name: String, square: Boolean): Bitmap? = try {
+                  val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                  c.contentResolver.openInputStream(uri)!!.use { BitmapFactory.decodeStream(it, null, bounds) }
+                  var sample = 1
+                  while (bounds.outWidth / sample > 1600 || bounds.outHeight / sample > 1600) sample *= 2
+                  val bmp = c.contentResolver.openInputStream(uri)!!.use {
+                      BitmapFactory.decodeStream(it, null, BitmapFactory.Options().apply { inSampleSize = sample })
+                  }!!
+                  val out: Bitmap = if (square) {
+                      val s = minOf(bmp.width, bmp.height)
+                      Bitmap.createScaledBitmap(Bitmap.createBitmap(bmp, (bmp.width - s) / 2, (bmp.height - s) / 2, s, s), 512, 512, true)
+                  } else {
+                      val k = 1280f / maxOf(bmp.width, bmp.height)
+                      if (k < 1f) Bitmap.createScaledBitmap(bmp, (bmp.width * k).toInt(), (bmp.height * k).toInt(), true) else bmp
+                  }
+                  val fmt = if (square) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
+                  File(c.filesDir, name).outputStream().use { out.compress(fmt, 92, it) }
+                  out
+              } catch (e: Throwable) { null }
+          }
+
+          object Vault {
+              fun dir(c: Context): File = File(c.filesDir, "vault").apply { mkdirs() }
+              fun list(c: Context): List<File> =
+                  dir(c).listFiles()?.filter { it.isFile }?.sortedByDescending { it.lastModified() } ?: emptyList()
+              fun kind(f: File): Int = when (f.extension.lowercase()) {
+                  "jpg", "jpeg", "png", "webp", "gif", "bmp" -> 0
+                  "apk" -> 1
+                  else -> 2
+              }
+              fun add(c: Context, uri: Uri): Boolean = try {
+                  var name = c.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+                      ?.use { if (it.moveToFirst()) it.getString(0) else null } ?: "file_${System.currentTimeMillis()}"
+                  name = name.replace('/', '_')
+                  var f = File(dir(c), name)
+                  if (f.exists()) f = File(dir(c), "${System.currentTimeMillis()}_$name")
+                  c.contentResolver.openInputStream(uri)!!.use { i -> f.outputStream().use { o -> i.copyTo(o) } }
+                  true
+              } catch (e: Throwable) { false }
+              fun export(c: Context, f: File, uri: Uri): Boolean = try {
+                  c.contentResolver.openOutputStream(uri)!!.use { o -> f.inputStream().use { it.copyTo(o) } }
+                  true
+              } catch (e: Throwable) { false }
+              fun size(f: File): String {
+                  val b = f.length()
+                  return when {
+                      b >= 1048576L -> "%.1f MB".format(b / 1048576.0)
+                      1024} KB"
+                      else -> "$b B"
+                  }
+              }
+          }
           END_5
           mkdir -p app/src/main/java/com/example/deepuninstaller
           cat > app/src/main/java/com/example/deepuninstaller/MainActivity.kt <<'END_6'
           package com.example.deepuninstaller
 
           import android.content.Context
+          import android.content.Intent
           import android.content.pm.ApplicationInfo
+          import android.graphics.BitmapFactory
           import android.os.Bundle
           import androidx.activity.ComponentActivity
+          import androidx.activity.compose.rememberLauncherForActivityResult
           import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
           import androidx.compose.foundation.Image
+          import androidx.compose.foundation.background
           import androidx.compose.foundation.clickable
           import androidx.compose.foundation.layout.*
           import androidx.compose.foundation.lazy.LazyColumn
           import androidx.compose.foundation.lazy.items
+          import androidx.compose.foundation.rememberScrollState
+          import androidx.compose.foundation.shape.CircleShape
+          import androidx.compose.foundation.shape.RoundedCornerShape
+          import androidx.compose.foundation.text.KeyboardOptions
+          import androidx.compose.foundation.verticalScroll
           import androidx.compose.material3.*
           import androidx.compose.runtime.*
           import androidx.compose.ui.Alignment
           import androidx.compose.ui.Modifier
+          import androidx.compose.ui.draw.clip
+          import androidx.compose.ui.graphics.Color
+          import androidx.compose.ui.graphics.ImageBitmap
           import androidx.compose.ui.graphics.asImageBitmap
+          import androidx.compose.ui.layout.ContentScale
           import androidx.compose.ui.platform.LocalContext
+          import androidx.compose.ui.res.painterResource
+          import androidx.compose.ui.text.input.KeyboardType
+          import androidx.compose.ui.text.input.PasswordVisualTransformation
+          import androidx.compose.ui.text.style.TextOverflow
           import androidx.compose.ui.unit.dp
+          import androidx.compose.ui.unit.sp
+          import androidx.core.content.pm.ShortcutInfoCompat
+          import androidx.core.content.pm.ShortcutManagerCompat
+          import androidx.core.graphics.drawable.IconCompat
           import androidx.core.graphics.drawable.toBitmap
           import kotlinx.coroutines.Dispatchers
           import kotlinx.coroutines.launch
           import kotlinx.coroutines.withContext
           import rikka.shizuku.Shizuku
+          import java.io.File
           import java.text.SimpleDateFormat
           import java.util.*
 
           class MainActivity : ComponentActivity() {
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
-                  setContent { MaterialTheme(colorScheme = darkColorScheme()) { App() } }
+                  setContent {
+                      MaterialTheme(
+                          colorScheme = darkColorScheme(
+                              primary = Color(0xFFB69CFF), secondary = Color(0xFF8FD3C8),
+                              background = Color(0xFF101018), surface = Color(0xFF1A1A24)
+                          )
+                      ) { Root() }
+                  }
+              }
+          }
+
+          @Composable
+          fun Root() {
+              val ctx = LocalContext.current
+              var unlocked by remember { mutableStateOf(!Lock.enabled(ctx)) }
+              if (unlocked) App(onLock = { unlocked = false }) else LockScreen { unlocked = true }
+          }
+
+          @Composable
+          fun LockScreen(onUnlocked: () -> Unit) {
+              val ctx = LocalContext.current
+              val n = Lock.count(ctx)
+              var step by remember { mutableIntStateOf(0) }
+              var pin by remember { mutableStateOf("") }
+              var err by remember { mutableStateOf("") }
+              var fails by remember { mutableIntStateOf(0) }
+              var until by remember { mutableLongStateOf(0L) }
+              Column(
+                  Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background).padding(24.dp),
+                  verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally
+              ) {
+                  Text("🔒", fontSize = 56.sp)
+                  Spacer(Modifier.height(12.dp))
+                  Text("أدخل الرمز ${step + 1} من $n", style = MaterialTheme.typography.titleMedium)
+                  Spacer(Modifier.height(12.dp))
+                  OutlinedTextField(
+                      pin, { pin = it.filter { c -> c.isDigit() } }, singleLine = true,
+                      visualTransformation = PasswordVisualTransformation(),
+                      keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword)
+                  )
+                  if (err.isNotEmpty()) Text(err, color = MaterialTheme.colorScheme.error)
+                  Spacer(Modifier.height(12.dp))
+                  Button(onClick = {
+                      val now = System.currentTimeMillis()
+                      if (now < until) {
+                          err = "انتظر ${(until - now) / 1000 + 1} ثانية"
+                      } else if (Lock.check(ctx, step, pin)) {
+                          pin = ""; err = ""
+                          if (step + 1 >= n) onUnlocked() else step++
+                      } else {
+                          fails++; pin = ""; step = 0; err = "رمز خاطئ"
+                          if (fails >= 5) { until = now + 30000; fails = 0; err = "محاولات كثيرة، انتظر 30 ثانية" }
+                      }
+                  }) { Text("دخول") }
               }
           }
 
           fun loadApps(ctx: Context): List<AppItem> {
               val pm = ctx.packageManager
               return pm.getInstalledApplications(0).map {
-                  AppItem(
-                      it.loadLabel(pm).toString(), it.packageName,
-                      (it.flags and ApplicationInfo.FLAG_SYSTEM) != 0, true
-                  )
+                  AppItem(it.loadLabel(pm).toString(), it.packageName, (it.flags and ApplicationInfo.FLAG_SYSTEM) != 0, true)
               }.sortedBy { it.label.lowercase() }
           }
 
@@ -249,9 +509,34 @@ jobs:
               }
           }
 
+          @Composable
+          fun CheckRow(checked: Boolean, onChange: (Boolean) -> Unit, label: String) {
+              Row(verticalAlignment = Alignment.CenterVertically) {
+                  Checkbox(checked, onChange)
+                  Text(label, Modifier.weight(1f))
+              }
+          }
+
+          @Composable
+          fun Pic(f: File, modifier: Modifier, px: Int, scale: ContentScale) {
+              val bmp by produceState<ImageBitmap?>(null, f.path) {
+                  value = withContext(Dispatchers.IO) {
+                      try {
+                          val o = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                          BitmapFactory.decodeFile(f.path, o)
+                          var s = 1
+                          while (o.outWidth / s > px || o.outHeight / s > px) s *= 2
+                          BitmapFactory.decodeFile(f.path, BitmapFactory.Options().apply { inSampleSize = s })?.asImageBitmap()
+                      } catch (e: Throwable) { null }
+                  }
+              }
+              val b = bmp
+              if (b != null) Image(b, null, modifier, contentScale = scale) else Text("🖼", modifier)
+          }
+
           @OptIn(ExperimentalMaterial3Api::class)
           @Composable
-          fun App() {
+          fun App(onLock: () -> Unit) {
               val ctx = LocalContext.current
               val scope = rememberCoroutineScope()
               val snack = remember { SnackbarHostState() }
@@ -261,7 +546,10 @@ jobs:
               var dirs by remember { mutableStateOf(listOf<String>()) }
               var history by remember { mutableStateOf(Store.load(ctx)) }
               var pending by remember { mutableStateOf<AppItem?>(null) }
+              var confirm by remember { mutableStateOf<AppItem?>(null) }
               var busy by remember { mutableStateOf(false) }
+              var headerBmp by remember { mutableStateOf(Img.load(ctx, "header.png")) }
+              var bgBmp by remember { mutableStateOf(Img.load(ctx, "bg.jpg")) }
 
               fun refresh() {
                   scope.launch {
@@ -269,6 +557,42 @@ jobs:
                       val d = withContext(Dispatchers.IO) { if (Sh.ready()) Sh.dataDirs() else emptyList() }
                       apps = a; dirs = d
                   }
+              }
+
+              val headerPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+                  if (uri != null) scope.launch {
+                      val r = withContext(Dispatchers.IO) { Img.save(ctx, uri, "header.png", true) }
+                      if (r != null) headerBmp = r else snack.showSnackbar("تعذّر فتح الصورة")
+                  }
+              }
+              val bgPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+                  if (uri != null) scope.launch {
+                      val r = withContext(Dispatchers.IO) { Img.save(ctx, uri, "bg.jpg", false) }
+                      if (r != null) bgBmp = r else snack.showSnackbar("تعذّر فتح الصورة")
+                  }
+              }
+
+              fun act(label: String, block: () -> Pair<Boolean, String>) {
+                  pending = null
+                  scope.launch {
+                      busy = true
+                      val r = withContext(Dispatchers.IO) { block() }
+                      busy = false
+                      refresh()
+                      snack.showSnackbar("$label: ${r.second}")
+                  }
+              }
+
+              fun pinShortcut() {
+                  val bmp = headerBmp ?: BitmapFactory.decodeResource(ctx.resources, R.drawable.icon)
+                  if (ShortcutManagerCompat.isRequestPinShortcutSupported(ctx)) {
+                      val info = ShortcutInfoCompat.Builder(ctx, "deep")
+                          .setShortLabel("الحذف الشامل")
+                          .setIcon(IconCompat.createWithBitmap(bmp))
+                          .setIntent(Intent(ctx, MainActivity::class.java).setAction(Intent.ACTION_MAIN))
+                          .build()
+                      ShortcutManagerCompat.requestPinShortcut(ctx, info, null)
+                  } else scope.launch { snack.showSnackbar("الجهاز لا يدعم الاختصارات") }
               }
 
               DisposableEffect(Unit) {
@@ -285,91 +609,153 @@ jobs:
 
               val installedPkgs = apps.map { it.pkg }.toSet()
               val leftovers = dirs.filter { it !in installedPkgs }.map { AppItem(it, it, false, false) }
+              val tabs = listOf("🔍 بحث", "📱 التطبيقات", "🧹 بقايا", "💾 النسخ", "🔒 الخزنة", "🕘 السجل", "⚙️ إعدادات")
 
-              Scaffold(
-                  snackbarHost = { SnackbarHost(snack) },
-                  bottomBar = {
-                      NavigationBar {
-                          listOf("🔍 بحث", "📱 التطبيقات", "🧹 بقايا", "🕘 السجل").forEachIndexed { i, t ->
-                              NavigationBarItem(selected = tab == i, onClick = { tab = i }, icon = { Text(t.take(2)) }, label = { Text(t.drop(3)) })
+              Box(Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+                  val bg = bgBmp
+                  if (bg != null) Image(bg.asImageBitmap(), null, Modifier.fillMaxSize(), contentScale = ContentScale.Crop, alpha = 0.22f)
+                  Scaffold(containerColor = Color.Transparent, snackbarHost = { SnackbarHost(snack) }) { pad ->
+                      Column(Modifier.padding(pad).fillMaxSize()) {
+                          Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                              val hb = headerBmp
+                              val mod = Modifier.size(56.dp).clip(CircleShape).clickable { headerPicker.launch("image/*") }
+                              if (hb != null) Image(hb.asImageBitmap(), null, mod, contentScale = ContentScale.Crop)
+                              else Image(painterResource(R.drawable.icon), null, mod, contentScale = ContentScale.Crop)
+                              Spacer(Modifier.width(12.dp))
+                              Text("الحذف الشامل", style = MaterialTheme.typography.titleLarge)
                           }
-                      }
-                  }
-              ) { pad ->
-                  Column(Modifier.padding(pad).fillMaxSize()) {
-                      if (!ready) {
-                          Card(Modifier.fillMaxWidth().padding(12.dp)) {
-                              Column(Modifier.padding(12.dp)) {
-                                  Text("Shizuku غير مفعّل أو لم تُمنح الصلاحية.")
-                                  Spacer(Modifier.height(8.dp))
-                                  Button(onClick = {
-                                      try {
-                                          if (Shizuku.pingBinder()) Shizuku.requestPermission(1)
-                                          else scope.launch { snack.showSnackbar("شغّل Shizuku أولاً") }
-                                      } catch (e: Throwable) { scope.launch { snack.showSnackbar("شغّل Shizuku أولاً") } }
-                                  }) { Text("منح الصلاحية") }
+                          if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+                          ScrollableTabRow(selectedTabIndex = tab, edgePadding = 8.dp, containerColor = Color.Transparent) {
+                              tabs.forEachIndexed { i, t -> Tab(selected = tab == i, onClick = { tab = i }, text = { Text(t) }) }
+                          }
+                          if (!ready) {
+                              Card(Modifier.fillMaxWidth().padding(12.dp)) {
+                                  Column(Modifier.padding(12.dp)) {
+                                      Text("Shizuku غير مفعّل أو لم تُمنح الصلاحية.")
+                                      Spacer(Modifier.height(8.dp))
+                                      Button(onClick = {
+                                          try {
+                                              if (Shizuku.pingBinder()) Shizuku.requestPermission(1)
+                                              else scope.launch { snack.showSnackbar("شغّل Shizuku أولاً") }
+                                          } catch (e: Throwable) { scope.launch { snack.showSnackbar("شغّل Shizuku أولاً") } }
+                                      }) { Text("منح الصلاحية") }
+                                  }
                               }
                           }
-                      }
-                      when (tab) {
-                          0 -> {
-                              var q by remember { mutableStateOf("") }
-                              OutlinedTextField(
-                                  q, { q = it }, Modifier.fillMaxWidth().padding(12.dp),
-                                  label = { Text("اكتب اسم التطبيق أو الحزمة") }, singleLine = true
-                              )
-                              val byPkg = (apps + leftovers).associateBy { it.pkg }
-                              val results = if (q.length < 2) emptyList() else dirs.mapNotNull { byPkg[it] }.filter {
-                                  it.label.contains(q, true) || it.pkg.contains(q, true)
+                          when (tab) {
+                              0 -> {
+                                  var q by remember { mutableStateOf("") }
+                                  OutlinedTextField(
+                                      q, { q = it }, Modifier.fillMaxWidth().padding(12.dp),
+                                      label = { Text("اكتب اسم التطبيق أو الحزمة") }, singleLine = true
+                                  )
+                                  val byPkg = (apps + leftovers).associateBy { it.pkg }
+                                  val results = if (q.length < 2) emptyList() else dirs.mapNotNull { byPkg[it] }.filter {
+                                      it.label.contains(q, true) || it.pkg.contains(q, true)
+                                  }
+                                  if (q.length >= 2 && results.isEmpty()) Text("لا نتائج في Android/data", Modifier.padding(16.dp))
+                                  LazyColumn { items(results, key = { it.pkg }) { AppRow(it) { pending = it } } }
                               }
-                              if (q.length >= 2 && results.isEmpty()) Text("لا نتائج في Android/data", Modifier.padding(16.dp))
-                              LazyColumn { items(results, key = { it.pkg }) { AppRow(it) { pending = it } } }
-                          }
-                          1 -> {
-                              var q by remember { mutableStateOf("") }
-                              var showSys by remember { mutableStateOf(false) }
-                              OutlinedTextField(q, { q = it }, Modifier.fillMaxWidth().padding(12.dp), label = { Text("فلترة") }, singleLine = true)
-                              Row(Modifier.padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
-                                  Switch(showSys, { showSys = it }); Spacer(Modifier.width(8.dp)); Text("إظهار تطبيقات النظام")
+                              1 -> {
+                                  var q by remember { mutableStateOf("") }
+                                  var showSys by remember { mutableStateOf(false) }
+                                  OutlinedTextField(q, { q = it }, Modifier.fillMaxWidth().padding(12.dp), label = { Text("فلترة") }, singleLine = true)
+                                  Row(Modifier.padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                                      Switch(showSys, { showSys = it }); Spacer(Modifier.width(8.dp)); Text("إظهار تطبيقات النظام")
+                                  }
+                                  val list = apps.filter { (showSys || !it.system) && (it.label.contains(q, true) || it.pkg.contains(q, true)) }
+                                  LazyColumn { items(list, key = { it.pkg }) { AppRow(it) { pending = it } } }
                               }
-                              val list = apps.filter { (showSys || !it.system) && (it.label.contains(q, true) || it.pkg.contains(q, true)) }
-                              LazyColumn { items(list, key = { it.pkg }) { AppRow(it) { pending = it } } }
-                          }
-                          2 -> {
-                              Text("مجلدات في Android/data لتطبيقات غير مثبتة:", Modifier.padding(16.dp))
-                              if (leftovers.isEmpty()) Text("لا توجد بقايا 👌", Modifier.padding(16.dp))
-                              LazyColumn { items(leftovers, key = { it.pkg }) { AppRow(it) { pending = it } } }
-                          }
-                          else -> {
-                              TextButton(onClick = { Store.clear(ctx); history = emptyList() }, Modifier.padding(8.dp)) { Text("مسح السجل") }
-                              if (history.isEmpty()) Text("السجل فارغ", Modifier.padding(16.dp))
-                              val fmt = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefault())
-                              LazyColumn {
-                                  items(history) { e ->
-                                      Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
-                                          Text((if (e.ok) "✅ " else "❌ ") + e.label)
-                                          Text(e.pkg, style = MaterialTheme.typography.bodySmall)
-                                          Text(fmt.format(Date(e.time)), style = MaterialTheme.typography.bodySmall)
-                                          Text(e.msg, style = MaterialTheme.typography.bodySmall)
-                                          HorizontalDivider(Modifier.padding(top = 8.dp))
+                              2 -> {
+                                  Text("مجلدات في Android/data لتطبيقات غير مثبتة:", Modifier.padding(16.dp))
+                                  if (leftovers.isEmpty()) Text("لا توجد بقايا 👌", Modifier.padding(16.dp))
+                                  LazyColumn { items(leftovers, key = { it.pkg }) { AppRow(it) { pending = it } } }
+                              }
+                              3 -> BackupsTab(ready, snack) { refresh() }
+                              4 -> VaultTab(snack, ready)
+                              5 -> {
+                                  TextButton(onClick = { Store.clear(ctx); history = emptyList() }, Modifier.padding(8.dp)) { Text("مسح السجل") }
+                                  if (history.isEmpty()) Text("السجل فارغ", Modifier.padding(16.dp))
+                                  val fmt = SimpleDateFormat("yyyy/MM/dd HH:mm", Locale.getDefault())
+                                  LazyColumn {
+                                      items(history) { e ->
+                                          Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+                                              Text((if (e.ok) "✅ " else "❌ ") + e.label)
+                                              Text(e.pkg, style = MaterialTheme.typography.bodySmall)
+                                              Text(fmt.format(Date(e.time)), style = MaterialTheme.typography.bodySmall)
+                                              Text(e.msg, style = MaterialTheme.typography.bodySmall)
+                                              HorizontalDivider(Modifier.padding(top = 8.dp))
+                                          }
                                       }
                                   }
                               }
+                              else -> SettingsTab(
+                                  hasHeader = headerBmp != null, hasBg = bgBmp != null,
+                                  onHeader = { headerPicker.launch("image/*") },
+                                  onBg = { bgPicker.launch("image/*") },
+                                  onRemoveHeader = { Img.remove(ctx, "header.png"); headerBmp = null },
+                                  onRemoveBg = { Img.remove(ctx, "bg.jpg"); bgBmp = null },
+                                  onShortcut = { pinShortcut() },
+                                  onLockNow = onLock
+                              )
                           }
                       }
                   }
               }
 
               pending?.let { item ->
+                  AlertDialog(
+                      onDismissRequest = { pending = null },
+                      icon = { AppIcon(item) },
+                                            title = { Text(item.label) },
+                      text = {
+                          Column(Modifier.verticalScroll(rememberScrollState())) {
+                              Text(item.pkg, style = MaterialTheme.typography.bodySmall)
+                              Spacer(Modifier.height(8.dp))
+                              TextButton(onClick = { confirm = item; pending = null }) { Text("🗑 حذف نهائي من الجذور") }
+                              if (item.installed && ready) {
+                                  TextButton(onClick = { act("نسخ احتياطي") { Sh.makeBackup(item.pkg, false) } }) { Text("💾 نسخة احتياطية (APK)") }
+                                  TextButton(onClick = { act("نسخ احتياطي") { Sh.makeBackup(item.pkg, true) } }) { Text("💾 نسخة مع data/obb") }
+                                  val prot = Sh.isProtected(ctx, item.pkg)
+                                  TextButton(onClick = {
+                                      act("إيقاف") { if (prot) false to "التطبيق محمي" else Sh.forceStop(item.pkg) }
+                                  }) { Text("⏹ إيقاف إجباري") }
+                                  TextButton(onClick = {
+                                      act("تجميد") { if (prot) false to "التطبيق محمي" else Sh.setFrozen(item.pkg, true) }
+                                  }) { Text("❄️ تجميد التطبيق") }
+                                  TextButton(onClick = { act("تجميد") { Sh.setFrozen(item.pkg, false) } }) { Text("🔥 إلغاء التجميد") }
+                              }
+                              if (item.installed) {
+                                  TextButton(onClick = {
+                                      pending = null
+                                      ctx.startActivity(
+                                          Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS, android.net.Uri.parse("package:${item.pkg}"))
+                                      )
+                                  }) { Text("ℹ️ معلومات التطبيق") }
+                              }
+                          }
+                      },
+                      confirmButton = {},
+                      dismissButton = { TextButton(onClick = { pending = null }) { Text("إغلاق") } }
+                  )
+              }
+
+              confirm?.let { item ->
                   var backup by remember(item.pkg) { mutableStateOf(true) }
+                  var withData by remember(item.pkg) { mutableStateOf(false) }
+                  var delRoots by remember(item.pkg) { mutableStateOf(true) }
                   var understand by remember(item.pkg) { mutableStateOf(!item.system) }
+                  var roots by remember(item.pkg) { mutableStateOf<List<String>?>(null) }
+                  LaunchedEffect(item.pkg) {
+                      roots = withContext(Dispatchers.IO) { if (Sh.ready()) Sh.scanRoots(item) else emptyList() }
+                  }
                   val blocked = Sh.isProtected(ctx, item.pkg)
                   AlertDialog(
-                      onDismissRequest = { if (!busy) pending = null },
+                      onDismissRequest = { if (!busy) confirm = null },
                       icon = { AppIcon(item) },
                       title = { Text("هل أنت متأكد؟") },
                       text = {
-                          Column {
+                          Column(Modifier.verticalScroll(rememberScrollState())) {
                               Text(item.label, style = MaterialTheme.typography.titleMedium)
                               Text(item.pkg, style = MaterialTheme.typography.bodySmall)
                               Spacer(Modifier.height(8.dp))
@@ -378,36 +764,283 @@ jobs:
                               } else {
                                   Text("⚠️ سيتم مسح بيانات التطبيق وحذفه وحذف مجلداته من Android/data و obb و media. لا يمكن التراجع.")
                                   if (item.system) Text("🚨 هذا تطبيق نظام. حذفه قد يسبب مشاكل أو حلقة إقلاع.", color = MaterialTheme.colorScheme.error)
-                                  if (item.installed) Row(verticalAlignment = Alignment.CenterVertically) {
-                                      Checkbox(backup, { backup = it }); Text("نسخ APK احتياطياً في Download/AppBackup")
+                                  val r = roots
+                                  if (r == null) Text("⏳ جارٍ فحص مجلدات الجذر...")
+                                  else if (r.isNotEmpty()) {
+                                      Spacer(Modifier.height(6.dp))
+                                      Text("📂 وجدت ${r.size} مسار مطابق في التخزين:")
+                                      r.take(6).forEach { Text(it.removePrefix("/sdcard/"), style = MaterialTheme.typography.bodySmall) }
+                                      if (r.size > 6) Text("... و${r.size - 6} أخرى", style = MaterialTheme.typography.bodySmall)
+                                      CheckRow(delRoots, { delRoots = it }, "حذفها كلها")
                                   }
-                                  if (item.system) Row(verticalAlignment = Alignment.CenterVertically) {
-                                      Checkbox(understand, { understand = it }); Text("أفهم المخاطر")
+                                  if (item.installed) {
+                                      CheckRow(backup, { backup = it }, "نسخة احتياطية قبل الحذف (Download/AppBackup)")
+                                      if (backup) CheckRow(withData, { withData = it }, "مع ملفات data/obb")
                                   }
+                                  if (item.system) CheckRow(understand, { understand = it }, "أفهم المخاطر")
                               }
                           }
                       },
                       confirmButton = {
-                          TextButton(enabled = !blocked && understand && !busy && ready, onClick = {
+                          TextButton(enabled = !blocked && understand && !busy && ready && roots != null, onClick = {
                               busy = true
+                              val extra = if (delRoots) (roots ?: emptyList()) else emptyList()
                               scope.launch {
-                                  val r = withContext(Dispatchers.IO) { Sh.delete(item, backup && item.installed) }
+                                  val r = withContext(Dispatchers.IO) { Sh.delete(item, backup && item.installed, withData, extra) }
                                   Store.add(ctx, Entry(item.label, item.pkg, System.currentTimeMillis(), r.first, r.second))
                                   history = Store.load(ctx)
-                                  busy = false; pending = null
-                                  snack.showSnackbar(if (r.first) "تم الحذف بنجاح" else r.second)
+                                  busy = false; confirm = null
                                   refresh()
+                                  snack.showSnackbar(if (r.first) "تم الحذف بنجاح" else r.second)
                               }
                           }) { Text(if (busy) "جارٍ الحذف..." else "حذف نهائياً") }
                       },
-                      dismissButton = { TextButton(enabled = !busy, onClick = { pending = null }) { Text("إلغاء") } }
+                      dismissButton = { TextButton(enabled = !busy, onClick = { confirm = null }) { Text("إلغاء") } }
                   )
               }
           }
+
+          @Composable
+          fun BackupsTab(ready: Boolean, snack: SnackbarHostState, onChanged: () -> Unit) {
+              val scope = rememberCoroutineScope()
+              var names by remember { mutableStateOf(listOf<String>()) }
+              var busy by remember { mutableStateOf(false) }
+              var del by remember { mutableStateOf<String?>(null) }
+              fun load() {
+                  scope.launch { names = withContext(Dispatchers.IO) { if (Sh.ready()) Sh.listBackups() else emptyList() } }
+              }
+              LaunchedEffect(ready) { load() }
+              Column(Modifier.fillMaxSize()) {
+                  Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                      Text("Download/AppBackup", Modifier.weight(1f), style = MaterialTheme.typography.bodySmall)
+                      TextButton(onClick = { load() }) { Text("تحديث") }
+                  }
+                  if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
+                  if (names.isEmpty()) Text("لا توجد نسخ احتياطية", Modifier.padding(16.dp))
+                  LazyColumn {
+                      items(names, key = { it }) { n ->
+                          Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                              Column(Modifier.weight(1f)) {
+                                  Text(n, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                  if (n.endsWith(".apk")) Text("ملف APK واحد (نسخة قديمة)", style = MaterialTheme.typography.bodySmall)
+                              }
+                              TextButton(enabled = !busy && ready, onClick = {
+                                  scope.launch {
+                                      busy = true
+                                      val r = withContext(Dispatchers.IO) { Sh.restore(n) }
+                                      busy = false
+                                      onChanged()
+                                      snack.showSnackbar(r.second)
+                                  }
+                              }) { Text("استعادة") }
+                              TextButton(enabled = !busy, onClick = { del = n }) { Text("حذف") }
+                          }
+                      }
+                  }
+              }
+              del?.let { n ->
+                  AlertDialog(
+                      onDismissRequest = { del = null },
+                      title = { Text("حذف النسخة؟") },
+                      text = { Text(n) },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              del = null
+                              scope.launch { withContext(Dispatchers.IO) { Sh.deleteBackup(n) }; load() }
+                          }) { Text("حذف") }
+                      },
+                      dismissButton = { TextButton(onClick = { del = null }) { Text("إلغاء") } }
+                  )
+              }
+          }
+
+          @Composable
+          fun VaultTab(snack: SnackbarHostState, ready: Boolean) {
+              val ctx = LocalContext.current
+              val scope = rememberCoroutineScope()
+              var files by remember { mutableStateOf(Vault.list(ctx)) }
+              var filter by remember { mutableIntStateOf(-1) }
+              var viewing by remember { mutableStateOf<File?>(null) }
+              var deleting by remember { mutableStateOf<File?>(null) }
+              var exporting by remember { mutableStateOf<File?>(null) }
+              val addPicker = rememberLauncherForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
+                  scope.launch {
+                      val n = withContext(Dispatchers.IO) { uris.count { Vault.add(ctx, it) } }
+                      files = Vault.list(ctx)
+                      snack.showSnackbar("تمت إضافة $n ملف")
+                  }
+              }
+              val exportPicker = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("*/*")) { uri ->
+                  val f = exporting
+                  if (uri != null && f != null) scope.launch {
+                      val ok = withContext(Dispatchers.IO) { Vault.export(ctx, f, uri) }
+                      snack.showSnackbar(if (ok) "تم التصدير" else "فشل التصدير")
+                  }
+              }
+              val shown = files.filter { filter == -1 || Vault.kind(it) == filter }
+              Column(Modifier.fillMaxSize()) {
+                  Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                      Button(onClick = { addPicker.launch("*/*") }) { Text("➕ إضافة ملفات") }
+                      Spacer(Modifier.width(8.dp))
+                      Text("${files.size} ملف", style = MaterialTheme.typography.bodySmall)
+                  }
+                  Row(Modifier.padding(horizontal = 12.dp)) {
+                      listOf(-1 to "الكل", 0 to "صور", 1 to "تطبيقات", 2 to "أخرى").forEach { (k, t) ->
+                          FilterChip(selected = filter == k, onClick = { filter = k }, label = { Text(t) }, modifier = Modifier.padding(end = 6.dp))
+                      }
+                  }
+                  Text(
+                      "الملفات تُحفظ داخل التطبيق ويحميها الرقم السري إن فعّلته، لكنها غير مشفّرة.",
+                      Modifier.padding(12.dp), style = MaterialTheme.typography.bodySmall
+                  )
+                  if (shown.isEmpty()) Text("لا توجد ملفات", Modifier.padding(16.dp))
+                  LazyColumn {
+                      items(shown, key = { it.name }) { f ->
+                          var menu by remember { mutableStateOf(false) }
+                          val kind = Vault.kind(f)
+                          Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                              if (kind == 0) Pic(f, Modifier.size(48.dp).clip(RoundedCornerShape(8.dp)), 256, ContentScale.Crop)
+                              else Text(if (kind == 1) "📦" else "📄", Modifier.size(48.dp), fontSize = 32.sp)
+                              Spacer(Modifier.width(12.dp))
+                              Column(Modifier.weight(1f)) {
+                                  Text(f.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                  Text(Vault.size(f), style = MaterialTheme.typography.bodySmall)
+                              }
+                              Box {
+                                  TextButton(onClick = { menu = true }) { Text("⋮") }
+                                  DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
+                                      if (kind == 0) DropdownMenuItem(text = { Text("عرض") }, onClick = { menu = false; viewing = f })
+                                      if (kind == 1 && ready) DropdownMenuItem(text = { Text("تثبيت") }, onClick = {
+                                          menu = false
+                                          scope.launch {
+                                              val r = withContext(Dispatchers.IO) { Sh.installFile(f) }
+                                              snack.showSnackbar(if (r.first) "تم التثبيت" else r.second)
+                                          }
+                                      })
+                                      DropdownMenuItem(text = { Text("تصدير") }, onClick = { menu = false; exporting = f; exportPicker.launch(f.name) })
+                                      DropdownMenuItem(text = { Text("حذف") }, onClick = { menu = false; deleting = f })
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+              viewing?.let { f ->
+                  AlertDialog(
+                      onDismissRequest = { viewing = null },
+                      text = { Pic(f, Modifier.fillMaxWidth(), 1600, ContentScale.Fit) },
+                      confirmButton = { TextButton(onClick = { viewing = null }) { Text("إغلاق") } }
+                  )
+              }
+              deleting?.let { f ->
+                  AlertDialog(
+                      onDismissRequest = { deleting = null },
+                      title = { Text("حذف من الخزنة؟") },
+                      text = { Text(f.name) },
+                      confirmButton = {
+                          TextButton(onClick = { f.delete(); files = Vault.list(ctx); deleting = null }) { Text("حذف") }
+                      },
+                      dismissButton = { TextButton(onClick = { deleting = null }) { Text("إلغاء") } }
+                  )
+              }
+          }
+
+          @Composable
+          fun SettingsTab(
+              hasHeader: Boolean, hasBg: Boolean,
+              onHeader: () -> Unit, onBg: () -> Unit,
+              onRemoveHeader: () -> Unit, onRemoveBg: () -> Unit,
+              onShortcut: () -> Unit, onLockNow: () -> Unit
+          ) {
+              val ctx = LocalContext.current
+              var enabled by remember { mutableStateOf(Lock.enabled(ctx)) }
+              var editing by remember { mutableStateOf(false) }
+              var count by remember { mutableIntStateOf(1) }
+              var p1 by remember { mutableStateOf("") }
+              var p2 by remember { mutableStateOf("") }
+              var msg by remember { mutableStateOf("") }
+              val digits = KeyboardOptions(keyboardType = KeyboardType.NumberPassword)
+              Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
+                  Text("🖼 الصور", style = MaterialTheme.typography.titleMedium)
+                  Spacer(Modifier.height(8.dp))
+                  OutlinedButton(onClick = onHeader, Modifier.fillMaxWidth()) { Text("تغيير صورة التطبيق (الدائرة بالأعلى)") }
+                  if (hasHeader) OutlinedButton(onClick = onRemoveHeader, Modifier.fillMaxWidth()) { Text("إزالة صورة التطبيق") }
+                  OutlinedButton(onClick = onBg, Modifier.fillMaxWidth()) { Text("تغيير صورة الخلفية داخل التطبيق") }
+                  if (hasBg) OutlinedButton(onClick = onRemoveBg, Modifier.fillMaxWidth()) { Text("إزالة الخلفية") }
+                  OutlinedButton(onClick = onShortcut, Modifier.fillMaxWidth()) { Text("إنشاء اختصار على الشاشة الرئيسية بصورتك") }
+                  Text(
+                      "أندرويد لا يسمح بتغيير الأيقونة الأصلية بعد التثبيت، لذلك الاختصار هو الطريقة.",
+                      style = MaterialTheme.typography.bodySmall
+                  )
+                  HorizontalDivider(Modifier.padding(vertical = 16.dp))
+                  Text("🔐 الحماية بالرقم السري (اختيارية)", style = MaterialTheme.typography.titleMedium)
+                  Spacer(Modifier.height(8.dp))
+                  if (enabled && !editing) {
+                      Text("الحماية مفعّلة (${Lock.count(ctx)} رمز).")
+                      OutlinedButton(onClick = onLockNow, Modifier.fillMaxWidth()) { Text("قفل الآن") }
+                      OutlinedButton(onClick = { editing = true; msg = "" }, Modifier.fillMaxWidth()) { Text("تغيير الرموز") }
+                      OutlinedButton(onClick = { Lock.disable(ctx); enabled = false; msg = "تم إيقاف الحماية" }, Modifier.fillMaxWidth()) { Text("إيقاف الحماية") }
+                  } else if (!editing) {
+                      Text("غير مفعّلة. التطبيق يفتح مباشرة.")
+                      Button(onClick = { editing = true; msg = "" }, Modifier.fillMaxWidth()) { Text("تفعيل الحماية") }
+                  } else {
+                      Text("كم رمزاً تريد؟")
+                      Row {
+                          FilterChip(selected = count == 1, onClick = { count = 1 }, label = { Text("رمز واحد") }, modifier = Modifier.padding(end = 8.dp))
+                          FilterChip(selected = count == 2, onClick = { count = 2 }, label = { Text("رمزان") })
+                      }
+                      OutlinedTextField(
+                          p1, { p1 = it.filter { c -> c.isDigit() } }, Modifier.fillMaxWidth().padding(top = 8.dp),
+                          label = { Text("الرمز الأول (4 أرقام على الأقل)") }, singleLine = true,
+                          visualTransformation = PasswordVisualTransformation(), keyboardOptions = digits
+                      )
+                      if (count == 2) OutlinedTextField(
+                          p2, { p2 = it.filter { c -> c.isDigit() } }, Modifier.fillMaxWidth().padding(top = 8.dp),
+                          label = { Text("الرمز الثاني") }, singleLine = true,
+                          visualTransformation = PasswordVisualTransformation(), keyboardOptions = digits
+                      )
+                      Text(
+                          "⚠️ إذا نسيت الرموز لن تدخل إلا بمسح بيانات التطبيق من إعدادات أندرويد، وستضيع ملفات الخزنة.",
+                          Modifier.padding(top = 8.dp), style = MaterialTheme.typography.bodySmall
+                      )
+                      Row(Modifier.padding(top = 8.dp)) {
+                          Button(onClick = {
+                              if (p1.length < 4 || (count == 2 && p2.length < 4)) msg = "كل رمز 4 أرقام على الأقل"
+                              else {
+                                  Lock.set(ctx, if (count == 1) listOf(p1) else listOf(p1, p2))
+                                  enabled = true; editing = false; p1 = ""; p2 = ""; msg = "تم حفظ الحماية"
+                              }
+                          }) { Text("حفظ") }
+                          Spacer(Modifier.width(8.dp))
+                          OutlinedButton(onClick = { editing = false; p1 = ""; p2 = ""; msg = "" }) { Text("إلغاء") }
+                      }
+                  }
+                  if (msg.isNotEmpty()) Text(msg, Modifier.padding(top = 8.dp), color = MaterialTheme.colorScheme.primary)
+              }
+          }
           END_6
+      - name: Add icon
+        run: |
+          mkdir -p app/src/main/res/drawable
+          SRC=""
+          for f in icon.png icon.jpg icon.jpeg icon.webp; do
+            if [ -f "$f" ]; then SRC="$f"; break; fi
+          done
+          if [ -n "$SRC" ]; then
+            convert "$SRC[0]" -resize 512x512 app/src/main/res/drawable/icon.png
+          else
+            convert -size 512x512 xc:'#7C4DFF' app/src/main/res/drawable/icon.png
+          fi
+      - name: Fixed signing key
+        run: |
+          mkdir -p ~/.android
+          echo "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" | base64 -d > ~/.android/debug.keystore
       - name: Build
+        env:
+          RUN_NUM: ${{ github.run_number }}
         run: gradle assembleDebug --no-daemon
       - uses: actions/upload-artifact@v4
         with:
           name: DeepUninstaller-APK
           path: app/build/outputs/apk/debug/*.apk
+          
